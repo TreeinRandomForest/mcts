@@ -384,7 +384,7 @@ For a state `s` and semantic action `a`:
 
 ```text
 score(s, a) =
-    Q(s, a)
+    Q_mean(s, a)
     +
     c_puct * P(s, a) * sqrt(sum_b N(s, b)) / (1 + N(s, a))
 ```
@@ -394,7 +394,7 @@ Where:
 ```text
 P(s, a) = strategy prior
 N(s, a) = edge visit count
-Q(s, a) = mean backed-up value
+Q_mean(s, a) = mean backed-up value
 ```
 
 Milestone A must support at least two prior modes:
@@ -650,7 +650,60 @@ No simulated future trajectory is required.
 
 ---
 
-# 16. Correctness
+# 16. Search Semantics: Global Program Search
+
+Milestone A does **not** use the exact AlphaGo Zero interaction pattern of:
+
+```text
+run MCTS
+-> commit to one root move
+-> re-root
+-> run a fresh MCTS
+```
+
+Instead, one MCTS run maintains the full kernel-search tree (or DAG) for the entire search budget.
+
+Each MCTS iteration performs approximately:
+
+```text
+root
+  |
+  v
+PUCT selection through existing nodes
+  |
+  v
+select semantic strategy
+  |
+  v
+progressive-widening decision
+  |
+  +-- descend to existing realization
+  |
+  `-- generate one new realization
+          |
+          v
+      compile/test/benchmark
+          |
+          v
+      backpropagate measured value
+```
+
+A single MCTS run therefore explores many optimization trajectories. The output of the run is the **best valid kernel discovered anywhere in the explored graph**, not necessarily the kernel associated with the most visited root action.
+
+Use the terminology:
+
+```text
+MCTS iteration: one select -> expand/evaluate -> backup cycle
+MCTS run: many MCTS iterations under one global search budget
+optimization trajectory: K0 -> K1 -> ... -> Kn
+search output: best valid kernel discovered during the run
+```
+
+This is intentional: kernel optimization is a single-player program-search problem with no external opponent forcing a commit after each search.
+
+---
+
+# 17. Correctness
 
 Correctness is a hard feasibility constraint.
 
@@ -677,7 +730,7 @@ Where practical, hidden/randomized tests should be generated independently from 
 
 ---
 
-# 17. Performance Reward
+# 18. Performance Reward
 
 Use root-normalized log speedup.
 
@@ -713,7 +766,7 @@ The benchmark harness should record raw timings as well as reward.
 
 ---
 
-# 18. Benchmark Timing
+# 19. Benchmark Timing
 
 Use CUDA-event-based kernel timing initially.
 
@@ -737,7 +790,7 @@ Compilation cost should be recorded separately.
 
 ---
 
-# 19. Evaluation Tiers
+# 20. Evaluation Tiers
 
 The evaluation loop should be hierarchical.
 
@@ -820,7 +873,7 @@ Nsight Systems should not be required in the inner search loop for Milestone A u
 
 ---
 
-# 20. Deduplication
+# 21. Deduplication
 
 Do not attempt full semantic program equivalence.
 
@@ -879,7 +932,7 @@ If reliable SASS hashing proves difficult, store binary/cubin hashes first and i
 
 ---
 
-# 21. Transposition Table
+# 22. Transposition Table
 
 Search states may be reached through multiple paths.
 
@@ -909,7 +962,7 @@ Repeated discovery of the same state is useful data and should not be discarded 
 
 ---
 
-# 22. Backpropagation
+# 23. Backpropagation
 
 After a valid leaf is measured:
 
@@ -917,23 +970,24 @@ After a valid leaf is measured:
 reward = measured log speedup
 ```
 
-Backpropagate through selected search edges.
-
-Each semantic action edge tracks:
+Backpropagate through selected search edges. Each semantic action edge should track at least:
 
 ```text
 N(s, a)
 W(s, a) = cumulative backed-up value
-Q(s, a) = W(s, a) / N(s, a)
+Q_mean(s, a) = W(s, a) / N(s, a)
+Q_max(s, a) = maximum descendant reward observed through this edge
 ```
 
-Initial implementation may use the measured leaf reward directly for all ancestors in the selected path.
+For Milestone A, PUCT selection should use `Q_mean(s, a)` as the default exploitation term. `Q_max` must be logged for analysis but should not replace `Q_mean` initially.
 
-No discount factor is necessary unless later experiments show a reason to penalize search depth.
+Kernel optimization is non-monotonic. A temporarily slower intermediate kernel may enable a much faster descendant. Therefore do not require every optimization step to improve performance, and do not prune a valid node merely because it is slower than its parent or slower than the best kernel seen so far.
 
----
+Initial implementation should back up the measured leaf reward along the selected path. No discount factor is necessary initially.
 
-# 23. Search Depth
+Future ablations may compare mean backup, max backup, mean/max mixtures, or top-quantile backup.
+
+# 24. Search Depth
 
 Do not hard-code a very shallow search.
 
@@ -957,9 +1011,25 @@ child_latency > parent_latency
 
 PUCT should naturally allocate fewer visits to poor branches.
 
+## 24.1 Temporary Performance Regressions
+
+Milestone A should **not** introduce a default rule such as “allow exactly K consecutive worsening moves.” The useful number of locally-worsening steps is unknown, a hard K adds another hyperparameter, and it can incorrectly prune useful longer trajectories.
+
+Instead:
+
+```text
+- allow any valid node to be expanded,
+- use max_depth as the structural trajectory bound,
+- use the global LLM-generation budget as the resource bound,
+- do not enforce monotonic improvement,
+- log both Q_mean and Q_max.
+```
+
+If traces later show that MCTS systematically fails to cross short performance valleys, add a valley-crossing ablation such as a minimum visit floor for new valid nodes, an exploration quota for locally worse nodes, a Q_mean/Q_max mixture, or top-quantile backup. None should be enabled by default in Milestone A.
+
 ---
 
-# 24. Stopping Rules
+# 25. Stopping Rules
 
 A search terminates when any configured condition is reached.
 
@@ -982,7 +1052,7 @@ For scientific comparisons, LLM-generation count is the primary fixed budget.
 
 ---
 
-# 25. Baseline Search Algorithms
+# 26. Baseline Search Algorithms
 
 All baselines should use the same:
 
@@ -1099,7 +1169,7 @@ This is the main Milestone A system.
 
 ---
 
-# 26. Search Budget
+# 27. Search Budget
 
 Suggested initial budgets per benchmark:
 
@@ -1117,7 +1187,7 @@ Start smaller during debugging.
 
 ---
 
-# 27. Suggested Initial Hyperparameters
+# 28. Suggested Initial Hyperparameters
 
 ```text
 num_strategies      ~= 22
@@ -1136,7 +1206,7 @@ Do not spend significant effort tuning these before the system works end-to-end.
 
 ---
 
-# 28. Kernel Backend Abstraction
+# 29. Kernel Backend Abstraction
 
 The search layer must not invoke CUDA-specific compilation, launch, disassembly, or profiling utilities directly.
 
@@ -1204,7 +1274,7 @@ Do not implement CuTe DSL or CUTLASS support during Milestone A.
 
 ---
 
-# 29. Strategy-Prior Interface
+# 30. Strategy-Prior Interface
 
 Define an interface such as:
 
@@ -1232,7 +1302,7 @@ The returned probabilities must sum to 1.
 
 ---
 
-# 30. Kernel-Generation Interface
+# 31. Kernel-Generation Interface
 
 Define an interface such as:
 
@@ -1266,7 +1336,7 @@ prompt hash
 
 ---
 
-# 31. Backend Compilation Interface
+# 32. Backend Compilation Interface
 
 Compilation is invoked through `KernelBackend`.
 
@@ -1289,7 +1359,7 @@ binary/cubin/PTX
 
 ---
 
-# 32. Correctness Interface
+# 33. Correctness Interface
 
 Define:
 
@@ -1313,7 +1383,7 @@ Correctness checks should be deterministic when seeded.
 
 ---
 
-# 33. Benchmark Interface
+# 34. Benchmark Interface
 
 Define:
 
@@ -1338,7 +1408,7 @@ max latency
 
 ---
 
-# 34. Profiler Interface
+# 35. Profiler Interface
 
 Profiling is accessed through `KernelBackend`.
 
@@ -1352,7 +1422,7 @@ Profile results must be cached per node/environment.
 
 ---
 
-# 35. Repository Structure
+# 36. Repository Structure
 
 Suggested initial repository layout:
 
@@ -1434,7 +1504,7 @@ Prefer simple modules over premature abstraction.
 
 ---
 
-# 36. Logging Requirements
+# 37. Logging Requirements
 
 Logging is important because Milestone B will train from Milestone A search traces.
 
@@ -1503,7 +1573,7 @@ SQLite is preferred if querying/search reconstruction becomes useful.
 
 ---
 
-# 37. Reproducibility
+# 38. Reproducibility
 
 Every run must record enough information to approximately reproduce the result.
 
@@ -1533,7 +1603,7 @@ Configuration reproducibility is required.
 
 ---
 
-# 38. Experimental Metrics
+# 39. Experimental Metrics
 
 For each benchmark and search algorithm, report:
 
@@ -1575,7 +1645,7 @@ These will be useful for Milestone B.
 
 ---
 
-# 39. Evaluation Against Expert Implementations
+# 40. Evaluation Against Expert Implementations
 
 Where available, measure:
 
@@ -1597,7 +1667,7 @@ Expert implementations are primarily an external quality reference.
 
 ---
 
-# 40. Important Non-Goals
+# 41. Important Non-Goals
 
 Do not allow the implementation to expand into the following during Milestone A:
 
@@ -1619,7 +1689,7 @@ Keep the search loop understandable and inspectable.
 
 ---
 
-# 41. Milestone A Deliverables
+# 42. Milestone A Deliverables
 
 Milestone A is complete when all of the following exist.
 
@@ -1703,7 +1773,7 @@ across algorithms and benchmarks.
 
 ---
 
-# 42. Future Backend Compatibility
+# 43. Future Backend Compatibility
 
 The backend abstraction is included now specifically to support later experiments with alternative kernel representations.
 
@@ -1756,7 +1826,7 @@ Do not implement any of this during Milestone A.
 
 ---
 
-# 43. Milestone B Compatibility
+# 44. Milestone B Compatibility
 
 Milestone A logging should make it possible to later train AlphaZero-like models.
 
@@ -1796,7 +1866,7 @@ Only preserve the data needed for it.
 
 ---
 
-# 44. Guiding Principle
+# 45. Guiding Principle
 
 Milestone A should remain a search experiment.
 
