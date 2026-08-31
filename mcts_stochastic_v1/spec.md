@@ -212,21 +212,325 @@ Conceptually:
 WorkloadContract:
     operation
     dtype
-    input shapes
-    allowed shape range
+    input shapes / shape constraints
     tensor layouts
     numerical tolerance
-    launch assumptions
-    benchmark input distribution
+    kernel launch constraints
+    benchmark shape distribution
 ```
 
 A workload contract should be immutable during a search.
 
 For Milestone A, fixed shapes or a small fixed set of shapes are preferred.
 
-If multiple shapes are used, the reward should aggregate across them.
+The workload contract should distinguish between:
 
----
+```text
+shape constraints:
+    shapes for which the kernel must be correct
+
+benchmark shape distribution:
+    shapes and weights used to score performance
+```
+
+A kernel may therefore be required to support a broader set of shapes than those heavily weighted in the performance objective.
+
+## 5.1 Tensor Layout Examples
+
+Tensor layout must be explicit because layout can materially affect optimization opportunities.
+
+Examples include:
+
+### GEMM
+
+```text
+A:
+    logical shape = [M, K]
+    layout = row-major contiguous
+
+B:
+    logical shape = [K, N]
+    layout = column-major
+
+C:
+    logical shape = [M, N]
+    layout = row-major contiguous
+```
+
+Alternative GEMM layouts may include:
+
+```text
+row-major / row-major
+row-major / column-major
+strided batched matrices
+transposed logical views
+packed low-precision formats
+```
+
+### RMSNorm
+
+```text
+x:
+    shape = [tokens, hidden]
+    layout = contiguous row-major
+    stride = [hidden, 1]
+```
+
+### Q/K Norm + RoPE
+
+Possible layouts include:
+
+```text
+[num_tokens, num_heads, head_dim]
+```
+
+or:
+
+```text
+[batch, sequence, num_heads, head_dim]
+```
+
+The workload must specify explicit strides if the tensor is not contiguous.
+
+### Quantized Kernels
+
+Layout may also include scale metadata, for example:
+
+```text
+per-tensor scale
+per-channel scale
+per-token scale
+block-wise scale
+```
+
+The scale tensor layout must be part of the workload contract.
+
+## 5.2 Numerical Tolerance Examples
+
+Correctness checks should use both relative and absolute tolerance where appropriate.
+
+Suggested initial examples:
+
+### FP32 reduction
+
+```text
+rtol = 1e-5
+atol = 1e-6
+```
+
+### FP16 / BF16 elementwise or normalization kernels
+
+```text
+rtol = 1e-2
+atol = 1e-2
+```
+
+### FP16 / BF16 Tensor-Core GEMM
+
+Initial default:
+
+```text
+rtol = 1e-2
+atol = 1e-2
+```
+
+The exact threshold may depend on:
+
+```text
+accumulation dtype
+reduction order
+reference implementation
+input distribution
+```
+
+### FP8 kernels
+
+A looser initial tolerance may be appropriate, for example:
+
+```text
+rtol = 5e-2
+atol = 5e-2
+```
+
+FP8 correctness should also explicitly check behavior such as:
+
+```text
+NaN propagation
+Inf handling
+saturation / clipping
+scale application
+```
+
+Where practical, reductions, softmax, and normalization kernels should be compared against a higher-precision reference implementation.
+
+Tolerance values belong to benchmark configuration and should not be hard-coded globally.
+
+## 5.3 Kernel Launch Parameters
+
+The workload contract should distinguish between:
+
+```text
+launch constraints:
+    externally imposed requirements
+
+launch choices:
+    parameters the generated kernel is allowed to optimize
+```
+
+Examples of launch parameters include:
+
+```text
+grid dimensions
+block dimensions
+threads per block
+dynamic shared-memory bytes
+cooperative launch requirement
+cluster dimensions
+launch bounds
+```
+
+Example:
+
+```yaml
+launch_constraints:
+  max_threads_per_block: 1024
+  dynamic_smem_max_bytes: 49152
+
+launch_choices:
+  block_size_choices: [128, 256, 512]
+```
+
+The generated kernel may choose among allowed launch configurations.
+
+The realized launch configuration must be recorded with every compiled candidate because launch configuration is part of effective kernel behavior.
+
+For deduplication, the binary/SASS fingerprint should therefore include relevant launch configuration such as:
+
+```text
+grid
+block
+dynamic shared memory
+cluster dimensions if used
+```
+
+## 5.4 Benchmark Shape Distribution
+
+For Milestone A, prefer a small finite weighted set of representative shapes rather than arbitrary dynamic shapes.
+
+Suggested size:
+
+```text
+4-8 representative shapes per benchmark
+```
+
+### GEMM Example
+
+Example weighted shape distribution:
+
+```text
+(M, N, K) = (4096, 4096, 4096), weight = 0.40
+(M, N, K) = (8192, 4096, 4096), weight = 0.30
+(M, N, K) = (128, 4096, 4096),  weight = 0.20
+(M, N, K) = (32, 4096, 4096),   weight = 0.10
+```
+
+The smaller-M cases are representative of more decode-like regimes.
+
+### RMSNorm Example
+
+Example dimensions:
+
+```text
+hidden in {4096, 5120, 8192}
+tokens in {1, 8, 32, 128, 512}
+```
+
+A concrete weighted subset might be:
+
+```text
+(tokens=1,   hidden=4096), weight=0.30
+(tokens=8,   hidden=4096), weight=0.25
+(tokens=32,  hidden=4096), weight=0.20
+(tokens=128, hidden=4096), weight=0.15
+(tokens=512, hidden=4096), weight=0.10
+```
+
+### Attention-Adjacent Example
+
+A Q/K norm + RoPE workload might define:
+
+```text
+head_dim in {64, 128}
+num_tokens in {1, 8, 32, 128}
+num_heads fixed or selected from a small model-relevant set
+```
+
+The distribution should be weighted toward the serving regime of interest.
+
+## 5.5 Reward Over Shape Distribution
+
+If multiple workload shapes are used, aggregate reward using the benchmark weights:
+
+```text
+reward(K) =
+    sum_i weight[i] * log(T_root[i] / T_K[i])
+```
+
+Weights should satisfy:
+
+```text
+sum_i weight[i] = 1
+```
+
+The benchmark harness must also preserve raw per-shape timing results.
+
+## 5.6 Example Workload Configuration
+
+Example RMSNorm configuration:
+
+```yaml
+workload:
+  op: rmsnorm
+  dtype: bf16
+
+  inputs:
+    - name: x
+      shape: [tokens, hidden]
+      layout: contiguous_row_major
+      strides: [hidden, 1]
+
+  tolerance:
+    rtol: 1.0e-2
+    atol: 1.0e-2
+
+  launch_constraints:
+    max_threads_per_block: 1024
+    dynamic_smem_max_bytes: 49152
+
+  launch_choices:
+    block_size_choices: [128, 256, 512]
+
+  shape_constraints:
+    tokens:
+      min: 1
+      max: 512
+    hidden:
+      allowed: [4096]
+
+  shape_distribution:
+    - shape: {tokens: 1, hidden: 4096}
+      weight: 0.30
+    - shape: {tokens: 8, hidden: 4096}
+      weight: 0.25
+    - shape: {tokens: 32, hidden: 4096}
+      weight: 0.20
+    - shape: {tokens: 128, hidden: 4096}
+      weight: 0.15
+    - shape: {tokens: 512, hidden: 4096}
+      weight: 0.10
+```
+
+Do not over-generalize workload schemas in Milestone A. Prefer explicit benchmark-specific configuration over a complex universal shape language.
 
 # 6. Target GPUs
 
@@ -297,7 +601,11 @@ Two different search paths may therefore reach the same state.
 
 The implementation may use a DAG / transposition table rather than a strict tree.
 
-Each node should store at least:
+Only candidates that successfully compile, launch, and pass correctness checks should become MCTS nodes.
+
+Failed LLM proposals must remain in generation/proposal logs and must **not** create search nodes.
+
+Each node should therefore store at least:
 
 ```text
 Node:
@@ -307,8 +615,6 @@ Node:
     backend_type
     normalized_program_hash
     binary_hash_or_sass_hash
-    compile_status
-    correctness_status
     benchmark_results
     reward
     lightweight_profile
@@ -317,6 +623,17 @@ Node:
     created_by_strategy
     created_by_llm_generation_id
 ```
+
+Because every node is valid by construction:
+
+```text
+compile_status = SUCCESS
+correctness_status = PASS
+```
+
+are implicit node invariants rather than required node fields.
+
+Detailed compile/correctness outcomes belong to the proposal-generation record.
 
 Profiler information is attached to a node but does not alter kernel semantics.
 
@@ -598,11 +915,68 @@ M_repair = 1 or 2
 
 Do not spend a large number of LLM calls repairing one candidate.
 
-After the repair budget is exhausted:
+After the repair budget is exhausted, the proposal remains a logged failed generation and does not become an MCTS node.
+
+Use a high-level proposal outcome:
+
+```text
+proposal_status =
+    VALID
+    INVALID
+```
+
+For invalid proposals, also record a detailed reason:
+
+```text
+invalid_reason =
+    COMPILE_FAILURE
+    LAUNCH_FAILURE
+    CORRECTNESS_FAILURE
+    TIMEOUT
+    OTHER
+```
+
+Keep lower-level validation fields as well:
+
+```text
+compile_status =
+    NOT_ATTEMPTED
+    SUCCESS
+    FAIL
+
+correctness_status =
+    NOT_TESTED
+    PASS
+    FAIL
+```
+
+Examples:
 
 ```text
 proposal_status = INVALID
+invalid_reason = COMPILE_FAILURE
+compile_status = FAIL
+correctness_status = NOT_TESTED
 ```
+
+or:
+
+```text
+proposal_status = INVALID
+invalid_reason = CORRECTNESS_FAILURE
+compile_status = SUCCESS
+correctness_status = FAIL
+```
+
+A valid proposal must satisfy:
+
+```text
+proposal_status = VALID
+compile_status = SUCCESS
+correctness_status = PASS
+```
+
+Only then is a search node created or deduplicated against the transposition table.
 
 Record:
 
@@ -1538,6 +1912,8 @@ GenerationRecord:
     llm_output
     candidate_program
     repair_attempt
+    proposal_status
+    invalid_reason
     compile_status
     correctness_status
     timings
@@ -1566,6 +1942,17 @@ EdgeRecord:
     Q
     prior
 ```
+
+Proposal-generation records must exist for both valid and invalid LLM outputs.
+
+Node records should exist only for candidates that satisfy:
+
+```text
+compile_status = SUCCESS
+correctness_status = PASS
+```
+
+Invalid proposals therefore contribute to search diagnostics and future training data without polluting the MCTS state graph.
 
 JSONL or SQLite is sufficient initially.
 
