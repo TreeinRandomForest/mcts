@@ -1168,7 +1168,7 @@ Compilation cost should be recorded separately.
 
 The evaluation loop should be hierarchical.
 
-## 19.1 Tier 0 — Mandatory for Every Valid Candidate
+## 20.1 Tier 0 — Mandatory for Every Valid Candidate
 
 Every valid candidate gets:
 
@@ -1183,7 +1183,7 @@ This produces the MCTS reward.
 
 ---
 
-## 19.2 Tier 1 — Lightweight Profiling
+## 20.2 Tier 1 — Lightweight Profiling
 
 Lightweight profiling is collected **lazily**.
 
@@ -1232,7 +1232,7 @@ The profiler output supplied to the LLM should be summarized into structured tex
 
 ---
 
-## 19.3 Tier 2 — Full Profiling
+## 20.3 Tier 2 — Full Profiling
 
 Full NCU / SASS / deeper profiling should only be collected for selected nodes, for example:
 
@@ -1253,7 +1253,7 @@ Do not attempt full semantic program equivalence.
 
 Use a simple two-level approach.
 
-## 20.1 Normalized Source Hash
+## 21.1 Normalized Source Hash
 
 Before compilation:
 
@@ -1276,7 +1276,7 @@ That is acceptable.
 
 ---
 
-## 20.2 Compiled / SASS Hash
+## 21.2 Compiled / SASS Hash
 
 After compilation:
 
@@ -1439,7 +1439,7 @@ All baselines should use the same:
 
 ---
 
-## 25.1 Independent Best-of-N
+## 26.1 Independent Best-of-N
 
 Every generation starts from the root kernel.
 
@@ -1458,7 +1458,7 @@ This tests whether tree structure provides value.
 
 ---
 
-## 25.2 Greedy Iterative Search
+## 26.2 Greedy Iterative Search
 
 Maintain one current kernel.
 
@@ -1477,7 +1477,7 @@ Strategy selection may use:
 
 ---
 
-## 25.3 Iterative Best-of-K
+## 26.3 Iterative Best-of-K
 
 At each step:
 
@@ -1500,7 +1500,7 @@ Generation budget must count every candidate.
 
 ---
 
-## 25.4 Beam Search
+## 26.4 Beam Search
 
 Maintain a beam of top `B_beam` kernels.
 
@@ -1521,7 +1521,7 @@ Suggested initial beam sizes:
 
 ---
 
-## 25.5 MCTS — Uniform Priors
+## 26.5 MCTS — Uniform Priors
 
 Run MCTS with:
 
@@ -1531,7 +1531,7 @@ P(a | s) = uniform
 
 ---
 
-## 25.6 MCTS — LLM Priors
+## 26.6 MCTS — LLM Priors
 
 Run MCTS with:
 
@@ -2080,7 +2080,7 @@ Keep the search loop understandable and inspectable.
 
 Milestone A is complete when all of the following exist.
 
-## 40.1 Functional Search Engine
+## 42.1 Functional Search Engine
 
 MCTS can:
 
@@ -2097,15 +2097,15 @@ backpropagate reward
 continue until budget exhausted
 ```
 
-## 40.2 Progressive Widening
+## 42.2 Progressive Widening
 
 A strategy may produce multiple LLM realizations without exploding the branching factor.
 
-## 40.3 Lazy Profiling
+## 42.3 Lazy Profiling
 
 Profiler data is collected only when useful for expansion.
 
-## 40.4 Deduplication
+## 42.4 Deduplication
 
 At minimum:
 
@@ -2119,7 +2119,7 @@ Preferably also:
 compiled/SASS hashing
 ```
 
-## 40.5 Baselines
+## 42.5 Baselines
 
 At least:
 
@@ -2133,7 +2133,7 @@ MCTS-LLM-prior
 
 Beam search may be added shortly afterward.
 
-## 40.6 Benchmark Suite
+## 42.6 Benchmark Suite
 
 At least four kernels working end-to-end.
 
@@ -2148,7 +2148,7 @@ SiLU-and-multiply
 Q/K RMSNorm + RoPE
 ```
 
-## 40.7 Results
+## 42.7 Results
 
 Produce plots:
 
