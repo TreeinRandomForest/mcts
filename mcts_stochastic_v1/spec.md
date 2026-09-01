@@ -798,13 +798,23 @@ num_children(s, a)
 
 be the number of distinct generated kernels currently associated with strategy `a` from state `s`.
 
-A new LLM realization is allowed when:
+Define the exact allowed child count as:
 
 ```text
-num_children(s, a)
-<
-c_pw * N(s, a) ** alpha_pw
+K_allowed(s, a) =
+    min(
+        K_max,
+        ceil(c_pw * N(s, a) ** alpha_pw)
+    )
 ```
+
+A new LLM realization is generated iff:
+
+```text
+num_children(s, a) < K_allowed(s, a)
+```
+
+Otherwise, the search selects among the existing realizations of `(s, a)`.
 
 Suggested initial values:
 
@@ -837,17 +847,54 @@ When PUCT selects a semantic action:
 
 Generate a fresh LLM candidate.
 
-### Case B: The action already has the maximum currently allowed children
+### Case B: Progressive widening is saturated
 
-Descend into an existing generated child.
+Select among the existing generated realizations using UCB.
 
-A simple UCB-style child selection may be used.
+For child realization `s'` under `(s, a)`:
 
-Exact child-selection policy is not a major Milestone A research variable.
+```text
+UCB(s, a, s') =
+    Q_mean(s')
+    +
+    c_ucb * sqrt(
+        log(1 + N(s, a))
+        /
+        (1 + N(s, a, s'))
+    )
+```
 
-Keep it simple and configurable.
+Where:
 
----
+```text
+N(s, a) =
+    number of visits to semantic action a from state s
+
+N(s, a, s') =
+    number of descents into concrete realization s'
+
+Q_mean(s') =
+    mean backed-up value of searches passing through s'
+```
+
+Then:
+
+```text
+selected_child =
+    argmax_s' UCB(s, a, s')
+```
+
+The hierarchy is therefore:
+
+```text
+state s
+  |
+  |-- PUCT selects semantic strategy a
+  |
+  `-- UCB selects concrete existing realization s'
+```
+
+There is no learned or LLM prior over individual generated realizations in Milestone A.
 
 # 13. LLM Generation Context
 
@@ -1164,6 +1211,56 @@ Compilation cost should be recorded separately.
 
 ---
 
+
+## 19.1 Measurement Noise and Drift
+
+Cloud GPU measurements may drift during long searches because of:
+
+```text
+temperature
+clock changes
+power-state changes
+background activity
+host contention
+```
+
+The benchmark harness should therefore:
+
+```text
+warm up before timing
+run multiple repetitions
+use median latency as the primary statistic
+record temperature/clocks/power state where observable
+record individual timing samples
+```
+
+If a timing sample set is obviously contaminated or unstable, mark the measurement as suspect and retry according to a small configurable retry policy.
+
+During long searches, periodically remeasure:
+
+```text
+root kernel
+current global-best kernel
+```
+
+Suggested initial policy:
+
+```text
+every 50-100 newly evaluated candidates
+```
+
+The purpose is to detect environment drift, not to continually rescore the entire tree.
+
+If drift is detected beyond a configurable threshold, record the event and either:
+
+```text
+remeasure affected reference kernels
+pause/retry measurement
+invalidate the run if the environment has materially changed
+```
+
+Do not silently mix measurements taken under materially different GPU operating conditions.
+
 # 20. Evaluation Tiers
 
 The evaluation loop should be hierarchical.
@@ -1246,6 +1343,40 @@ Do not run expensive full profiling for every leaf.
 Nsight Systems should not be required in the inner search loop for Milestone A unless the benchmark involves multiple kernels or system-level overlap.
 
 ---
+
+
+## 20.4 Evaluation Caching
+
+An MCTS tree visit is **not** the same thing as a hardware evaluation.
+
+Once a valid node has been compiled, correctness-tested, and benchmarked, its evaluation result is cached.
+
+Subsequent MCTS visits to that node reuse cached:
+
+```text
+reward
+benchmark statistics
+compile artifact
+correctness result
+lightweight profile if already collected
+full profile if already collected
+```
+
+A new GPU evaluation normally occurs only when:
+
+```text
+progressive widening creates a new concrete realization
+an explicit measurement-drift policy requests remeasurement
+a required cached artifact/profile is missing or invalid
+```
+
+Therefore:
+
+```text
+MCTS visit != GPU evaluation
+```
+
+Do not rerun a kernel merely because the tree traverses an existing node.
 
 # 21. Deduplication
 
@@ -1545,12 +1676,51 @@ This is the main Milestone A system.
 
 # 27. Search Budget
 
-Suggested initial budgets per benchmark:
+The primary search budget is the number of **candidate-generation LLM calls**.
+
+Define:
 
 ```text
-100 LLM generations
-250 LLM generations
-500 LLM generations
+B_gen =
+    total number of candidate-generation LLM calls
+```
+
+This count includes:
+
+```text
+initial candidate-generation calls
+repair calls
+regeneration calls after invalid proposals
+```
+
+A failed candidate does **not** receive free repair budget outside `B_gen`.
+
+Strategy-prior calls are tracked separately because one prior call may score the complete semantic action set rather than generate a kernel.
+
+Record at least:
+
+```text
+B_gen
+B_prior
+candidate-generation input/output tokens
+strategy-prior input/output tokens
+estimated LLM cost where available
+```
+
+Use:
+
+```text
+B_gen
+```
+
+as the primary x-axis for search-efficiency comparisons.
+
+Suggested initial candidate-generation budgets per benchmark:
+
+```text
+100
+250
+500
 ```
 
 The system should support checkpointed measurements so performance can be plotted as a function of budget.
@@ -1572,6 +1742,7 @@ c_pw                 = 1.0
 max_depth            = 10
 generation_budget    = configurable
 c_puct               = configurable
+c_ucb                = configurable
 ```
 
 Do not spend significant effort tuning these before the system works end-to-end.
@@ -1901,12 +2072,14 @@ SearchRun:
 GenerationRecord:
     generation_id
     run_id
+    counts_toward_B_gen
     parent_node_id
     backend_type
     strategy_id
     strategy_prior
     parent_visit_count
-    parent_action_Q
+    parent_action_Q_mean
+    parent_action_Q_max
     llm_prompt
     prompt_hash
     llm_output
@@ -1939,7 +2112,8 @@ EdgeRecord:
     strategy_id
     child_node_id
     visit_count
-    Q
+    Q_mean
+    Q_max
     prior
 ```
 
@@ -2017,6 +2191,10 @@ LLM token usage
 LLM wall-clock latency
 search depth of best candidate
 number of unique states
+number of GPU evaluations
+number of MCTS visits
+B_gen
+B_prior
 ```
 
 Also record strategy statistics such as:
@@ -2253,8 +2431,296 @@ Only preserve the data needed for it.
 
 ---
 
-# 45. Guiding Principle
+# 45. Remote GPU Worker Infrastructure
 
+Milestone A should support running the search controller locally while executing kernel evaluations on ephemeral remote GPU workers.
+
+The intended topology is:
+
+```text
+local laptop
+  |
+  |-- spec.md
+  |-- MCTS/search controller
+  |-- LLM API calls
+  |-- search database / logs
+  |
+  `-- GPUProvider
+        |
+        `-- RunPodProvider
+              |
+              +-- acquire/reuse GPU worker
+              +-- submit candidate for evaluation
+              +-- receive structured result
+              `-- release/terminate worker
+```
+
+The search controller must remain provider-agnostic. RunPod-specific lifecycle logic must not live inside MCTS, PUCT, KernelBackend, correctness, or benchmark logic.
+
+## 45.1 GPU Provider Interface
+
+Define a thin provider abstraction:
+
+```python
+class GPUProvider:
+    def acquire_worker(self, hardware_spec) -> "GPUWorker":
+        ...
+
+    def release_worker(self, worker: "GPUWorker") -> None:
+        ...
+```
+
+Milestone A may implement `RunPodProvider`. Future providers such as a local GPU, another cloud, or an internal cluster should be addable without changing search logic.
+
+## 45.2 RunPod Authentication
+
+RunPod credentials must be supplied through environment variables. Recommended local setup:
+
+```bash
+export RUNPOD_API_KEY="..."
+```
+
+Configuration references only the environment-variable name:
+
+```yaml
+gpu_provider:
+  type: runpod
+  api_key_env: RUNPOD_API_KEY
+```
+
+Never place the API key in `spec.md`, source code, YAML configuration, LLM prompts, logs, SQLite records, git history, or container images. If the environment variable is absent, fail with a clear configuration error.
+
+## 45.3 Worker Lifecycle
+
+Do not create one pod per MCTS node. Default behavior should be:
+
+```text
+one MCTS run
+    -> one warm GPU worker
+    -> many candidate evaluations
+    -> worker released after run
+```
+
+Initial implementation should use one worker and sequential node evaluation. Do not implement parallel MCTS initially.
+
+## 45.4 RunPod Configuration
+
+RunPod configuration should be externalized, for example:
+
+```yaml
+gpu_provider:
+  type: runpod
+  api_key_env: RUNPOD_API_KEY
+
+  pod:
+    gpu_count: 1
+    gpu_type: H100_SXM
+    image: your-registry/kernel-mcts:cuda-12.x
+    container_disk_gb: 50
+    interruptible: false
+
+  lifecycle:
+    reuse_within_search_run: true
+    terminate_after_run: true
+```
+
+Exact provider identifiers and API payload details belong in provider-specific code/config, not MCTS code. Prefer non-interruptible workers for controlled Milestone A comparisons.
+
+## 45.5 Remote Worker Interface
+
+Separate infrastructure lifecycle from kernel evaluation:
+
+```python
+class GPUWorker:
+    def get_environment_manifest(self) -> dict:
+        ...
+
+    def evaluate(self, candidate, workload, profile_level) -> "EvaluationResult":
+        ...
+```
+
+The worker returns structured results including compile status, correctness, benchmark results, profiling results when requested, launch configuration, fingerprints, worker ID, environment-manifest ID, and timestamps.
+
+The local controller remains authoritative for MCTS state, PUCT statistics, generation budget, transposition table, and experiment logging.
+
+## 45.6 Worker Container
+
+Use a reproducible worker container image containing at least:
+
+```text
+CUDA toolkit / nvcc
+Nsight Compute CLI where available
+nvdisasm and/or cuobjdump
+clang-format
+Python runtime
+kernel evaluation harness
+required benchmark dependencies
+```
+
+Record both container image tag and, where possible, immutable image digest.
+
+## 45.7 Environment Manifest
+
+Every worker must capture an environment manifest after the pod is running and before benchmark evaluation begins. Capture it once per worker unless the environment changes.
+
+Record as much of the following as practical.
+
+### GPU
+
+```text
+GPU model
+GPU UUID
+compute capability
+SM count
+total memory
+PCIe/SXM form factor where known
+MIG configuration if applicable
+```
+
+### GPU Runtime / Driver
+
+```text
+NVIDIA driver version
+CUDA driver/runtime version
+CUDA toolkit version
+nvcc version
+```
+
+### Profiling / Binary Tools
+
+```text
+Nsight Compute version
+Nsight Systems version if installed
+nvdisasm version
+cuobjdump version
+```
+
+### Performance-Relevant Libraries
+
+Record versions for used libraries and, where installed, useful context such as:
+
+```text
+PyTorch
+Triton
+CUTLASS
+CuTe DSL
+cuBLAS
+cuBLASLt
+cuDNN where relevant
+NCCL where relevant
+Python
+C/C++ compiler toolchain
+```
+
+### Host / Container
+
+```text
+Linux distribution
+kernel version
+CPU model
+container image tag
+container image digest
+container runtime information where available
+hostname / worker ID
+```
+
+### GPU Operating State
+
+Where observable, record:
+
+```text
+power limit
+clock configuration / application clocks
+persistence mode
+ECC status
+temperature at run start
+GPU utilization at run start
+memory utilization at run start
+```
+
+Do not require privileged operations merely to set these values. Record what can be observed. If clocks or power limits are modified, record requested and observed settings.
+
+### Project State
+
+```text
+git commit
+dirty-tree status
+benchmark config hash
+strategy config hash
+workload config hash
+backend implementation version/hash
+search config hash
+```
+
+Assign a stable `environment_manifest_id`. Every evaluation from that worker must reference it.
+
+## 45.8 Environment Validation
+
+Before accepting benchmark results, validate the observed worker environment against requested constraints, including GPU model, form factor when required, compute capability, CUDA/toolchain requirements, and profiler availability when requested.
+
+If validation fails, do not begin search evaluation. Report the mismatch and release or quarantine the worker. Never silently benchmark a different hardware class than requested.
+
+## 45.9 Environment Manifest Logging
+
+Store a worker/environment record such as:
+
+```text
+EnvironmentManifest:
+    environment_manifest_id
+    worker_id
+    provider
+    pod_id
+    gpu_model
+    gpu_uuid
+    compute_capability
+    driver_version
+    cuda_runtime_version
+    cuda_toolkit_version
+    nvcc_version
+    profiler_versions
+    library_versions
+    host_information
+    container_image
+    container_digest
+    gpu_operating_state
+    project_git_commit
+    config_hashes
+    captured_at
+```
+
+Each `SearchRun` must reference `environment_manifest_id`. Evaluation/generation records should retain worker identity as well so future multi-worker runs remain diagnosable.
+
+## 45.10 Remote Evaluation Reliability
+
+Remote requests should be safely retryable. Use identifiers such as:
+
+```text
+run_id
+generation_id
+candidate_id
+evaluation_id
+```
+
+Distinguish infrastructure failures from kernel failures:
+
+```text
+INFRASTRUCTURE_FAILURE
+COMPILE_FAILURE
+LAUNCH_FAILURE
+CORRECTNESS_FAILURE
+BENCHMARK_FAILURE
+PROFILE_FAILURE
+```
+
+Infrastructure failure must not count as evidence that an LLM proposal or strategy is invalid. The controller may retry infrastructure failures according to a small configurable retry policy.
+
+## 45.11 Security
+
+The remote-worker protocol must transmit only information needed for kernel evaluation. Do not forward LLM API keys, the RunPod API key, the local shell environment, or unrelated credentials to the GPU worker. Registry credentials should be managed through deployment/provider mechanisms rather than prompts or experiment logs.
+
+---
+
+# 46. Guiding Principle
 Milestone A should remain a search experiment.
 
 The implementation should optimize for:
